@@ -7,22 +7,54 @@
  *   is ~183 Hz / 8 bit (12 MHz / 65536) and every call can block while it waits for the
  *   timer to roll over. The six pins are also driven by six unsynchronised timers.
  *
- * What this does:
- *   - one CTIMER segment (A or B half of a timer) per pin, 6 in total
- *   - all segments use the 12 MHz HFRC clock and the same period (default 20 kHz = 600 counts)
- *   - all segments are held by the global enable register (GLOBEN) while they are configured,
- *     then released together, so the six counters start in phase
- *   - the low-side segments have their output polarity inverted (TMRxPOL), so the low side
- *     is the exact complement of the high side, with a dead zone of 'dead_zone' * period
- *     created by shortening the high-side pulse and lengthening the low-side one
- *   - a duty cycle update is a single 32 bit register write per pin (no blocking)
+ * How it works:
+ *   - One CTIMER segment (A or B half of a timer) per pin, 6 in total, all on the 12 MHz
+ *     HFRC clock with the same period P (default 20 kHz = 600 counts).
+ *   - A segment in repeated-PWM mode is low from count 0 until its compare value c0, then
+ *     high until the end of the period. So every segment has one edge we can move (c0) and
+ *     one edge fixed at the period wrap.
+ *   - High side: active-high pulse from c0H to the wrap.
+ *   - Low side: polarity inverted, so it is on from its wrap until its c0L.
+ *   - The low side counters are started 'lag' counts after the high side counters. That puts
+ *     a gap of 'lag' counts between "high side off" (high side wrap) and "low side on"
+ *     (low side wrap). The other gap, "low side off" -> "high side on", is set by c0L.
+ *     Both edges therefore get dead time: lag ~= dead = dead_zone * P / 2 counts per edge.
+ *   - The lag is measured after start-up and used in all later calculations.
+ *
+ *     count (high side frame):  0       lag            c0L+lag    c0H           P
+ *     high side:                ______________________________________|'''''''''''|
+ *     low side:                 ________|'''''''''''''''''''|______________________
+ *                                 gap = lag             gap = dead
+ *
+ *   - The Apollo3 compare registers are not double-buffered: a new value takes effect
+ *     immediately. Writing while the counter is between a phase's edges could make the
+ *     low side miss its turn-off while the high side still turns on, i.e. both on at once.
+ *     Each phase update therefore waits (with interrupts enabled) until the counter is
+ *     before all, or after all, of that phase's old and new edges, then writes both registers
+ *     inside a short critical section. Big jumps in duty cycle go via 50% in two steps.
+ *     The safety margins are sized from the measured cost of a counter read and of a
+ *     register write (printed at start-up). Typical wait: a few us per phase; worst case
+ *     about one PWM period.
+ *   - The low side lag is set with a fixed ROM delay between the two GLOBEN writes, which is
+ *     measured and corrected at start-up (printed as "low side lag").
+ *
+ * Phase states (SimpleFOC semantics):
+ *   PHASE_ON  - both sides PWM (complementary, with dead time)
+ *   PHASE_HI  - high side PWM, low side held off
+ *   PHASE_LO  - low side PWM, high side held off
+ *   PHASE_OFF - both sides held off
+ *   A side is "held off" by switching its pad to a plain GPIO output at the off level.
  *
  * Notes:
  *   - PWM is edge aligned (the Apollo3 counters only count up).
- *   - CTIMER 7 is skipped, because mbed uses it for the low power ticker.
- *   - Pads are mapped to CTIMER segments automatically from the same pad table the SparkFun
- *     core uses; each pin gets its own segment, so no two pins ever share a counter.
- *   - Phase states (OFF / HI / LO) are done by switching the pads back to plain GPIO.
+ *   - CTIMER 7 is never used, because mbed uses it for the low power ticker.
+ *   - Pads are mapped to CTIMER segments automatically (with backtracking) from the same pad
+ *     table the SparkFun core uses; each pin gets its own segment.
+ *   - The duty cycle is clamped near the ends: at 20 kHz with the default 2% dead zone,
+ *     duty values below ~1.3% or above ~97.5% are clamped (the high side pulse never
+ *     gets shorter than 2 counts, the low side pulse never shorter than ~4 counts).
+ *   - The low side polarity inversion (TMRxPOL) is essential. Check H and L of each phase
+ *     with a scope or logic analyser, motor supply off, before driving the motor.
  */
 
 #include "../hardware_api.h"
@@ -34,9 +66,13 @@
 #define AP3_PWM_CLK            AM_HAL_CTIMER_HFRC_12MHZ
 #define AP3_PWM_CLK_HZ         12000000UL
 #define AP3_PWM_DEFAULT_FREQ   20000UL
-#define AP3_PWM_MIN_PERIOD     20UL        // counts - below this the resolution is pointless
+#define AP3_PWM_MIN_PERIOD     100UL       // counts - room for dead time, margins and resolution
 #define AP3_PWM_MAX_PERIOD     65535UL     // 16 bit counter
 #define AP3_PWM_DRIVE          AM_HAL_GPIO_PIN_DRIVESTRENGTH_4MA
+#define AP3_MIN_DEAD           2           // counts per edge (167 ns)
+#define AP3_EDGE_MIN           2           // compare values are kept in [AP3_EDGE_MIN, P-1-AP3_EDGE_MIN]
+#define AP3_LAG_ATTEMPTS       8           // start-up attempts to set the low side counter lag
+#define AP3_CNT_PER_DELAY_IT   0.75f       // am_hal_flash_delay(): 3 CPU cycles @ 48 MHz = 0.75 timer counts @ 12 MHz
 
 // ---------------------------------------------------------------------------------------
 // Pad -> CTIMER output tables.
@@ -102,64 +138,190 @@ typedef struct {
   bool     active_high;  // level on the pad that switches the MOSFET on
 } Ap3Channel;
 
-enum Ap3PairMode : uint8_t { AP3_MODE_UNKNOWN = 0, AP3_MODE_PWM, AP3_MODE_OFF, AP3_MODE_HI, AP3_MODE_LO };
-
 typedef struct {
   Ap3Channel ch[6];      // [0]=A high, [1]=A low, [2]=B high, [3]=B low, [4]=C high, [5]=C low
-  uint32_t   period;     // PWM period in timer counts
-  float      dead_zone;  // fraction of the period
-  Ap3PairMode mode[3];
+  int32_t    period;     // P, PWM period in timer counts
+  int32_t    dead;       // dead time in counts at the "low side off -> high side on" edge
+  int32_t    lag[3];     // measured low side counter lag per phase = dead time at the wrap edge
+  int32_t    c0H[3];     // compare values currently in the high side registers
+  int32_t    c0L[3];     // compare values currently in the low side registers (low side frame)
+  int32_t    midH[3];    // compare values for 50% duty, used as a stepping stone for big jumps
+  int32_t    midL[3];
+  int32_t    margin;     // counts from a counter read until both compare registers are written (measured)
+  int32_t    slot;       // shortest counter range the polling loop is sure to see (measured)
+  uint32_t   guard;      // polling iterations after which the counter is considered stopped
+  bool       pwm[6];     // pad connected to its timer (true) or held off as GPIO (false)
 } Ap3DriverParams;
+
+static inline int32_t ap3_min(int32_t a, int32_t b) { return a < b ? a : b; }
+static inline int32_t ap3_max(int32_t a, int32_t b) { return a > b ? a : b; }
 
 // bit position of a segment in CTIMER->GLOBEN (ENA0=bit0, ENB0=bit1, ENA1=bit2, ...)
 static inline uint32_t ap3_globen_bit(const Ap3Channel& c) {
   return 1UL << (c.timer * 2 + (c.segment == AM_HAL_CTIMER_TIMERB ? 1 : 0));
 }
 
-// Choose a free CTIMER segment that can output on 'pad' (primary OUT only, not OUT2).
-static bool ap3_pick_segment(uint8_t pad, uint16_t& used, Ap3Channel& c) {
-  uint8_t ctx = 0;
-  for (; ctx < 32; ctx++) {
-    if (AP3_CTX_PADNUM(ctx) == pad) break;
+static int ap3_find_ctx(int pad) {
+  if (pad < 0 || pad == 37 || pad == 39) return -1;   // 37/39 are special-cased in the core
+  for (int ctx = 0; ctx < 32; ctx++) {
+    if (AP3_CTX_PADNUM(ctx) == pad) return ctx;
   }
-  if (ctx >= 32) return false;
-  if (pad == 37 || pad == 39) return false;   // special-cased in the core, not supported here
-  for (uint8_t n = 0; n < 4; n++) {
+  return -1;
+}
+
+// Give each pin its own CTIMER segment (primary OUT only, never timer 7). Backtracking.
+static bool ap3_allocate(const int* pins, int idx, uint16_t used, Ap3Channel* ch) {
+  if (idx == 6) return true;
+  int ctx = ap3_find_ctx(pins[idx]);
+  if (ctx < 0) return false;
+  for (int n = 0; n < 4; n++) {
     uint8_t v = ap3_outcfg_tbl[ctx][n];
-    if (v & 0x10) continue;                    // OUT2 - skip
+    if (v & 0x10) continue;                    // OUT2 - not used
     uint8_t timer = v & 0x7;
     bool isB = (v & 0x8) != 0;
     if (timer == 7) continue;                  // used by mbed low power ticker
     uint16_t bit = 1u << (timer * 2 + (isB ? 1 : 0));
     if (used & bit) continue;
-    used |= bit;
-    c.pad = pad;
-    c.timer = timer;
-    c.segment = isB ? AM_HAL_CTIMER_TIMERB : AM_HAL_CTIMER_TIMERA;
-    return true;
+    ch[idx].pad = (uint8_t)pins[idx];
+    ch[idx].timer = timer;
+    ch[idx].segment = isB ? AM_HAL_CTIMER_TIMERB : AM_HAL_CTIMER_TIMERA;
+    if (ap3_allocate(pins, idx + 1, used | bit, ch)) return true;
   }
   return false;
 }
 
-// Set the on-time (in counts) of a segment. One 32 bit write -> atomic w.r.t. the counter.
-// Rising edge at (period-1 - on), falling edge / wrap at (period-1): the pulse sits at the end of the period.
-static inline void ap3_set_on_time(const Ap3Channel& c, uint32_t period, uint32_t on) {
+// Counter value of a segment. Same method as am_hal_ctimer_read() (triple read, to
+// reject a read torn by the clock domain crossing), without the table lookups.
+static inline int32_t ap3_read_count(const Ap3Channel& c) {
+  uint32_t v[3];
+  am_hal_triple_read((uint32_t)CTIMERADDRn(CTIMER, c.timer, TMR0), v);
+  uint32_t sh = (c.segment == AM_HAL_CTIMER_TIMERB) ? 16 : 0;
+  uint32_t a = (v[0] >> sh) & 0xFFFF;
+  uint32_t b = (v[1] >> sh) & 0xFFFF;
+  uint32_t d = (v[2] >> sh) & 0xFFFF;
+  return (int32_t)(((a & ~0x1Fu) == (b & ~0x1Fu)) ? b : d);
+}
+
+// Lag of the low side counter behind the high side counter, in counts (0..P-1).
+// The low side read is bracketed by two high side reads, so the read time cancels out.
+static int32_t ap3_measure_lag(const Ap3Channel& H, const Ap3Channel& L, int32_t P) {
+  for (int attempt = 0; attempt < 4; attempt++) {
+    const int32_t h1 = ap3_read_count(H);
+    const int32_t l  = ap3_read_count(L);
+    const int32_t h2 = ap3_read_count(H);
+    if (h2 < h1) continue;                     // a wrap happened in between - read again
+    int32_t d = ((h1 + h2 + 1) / 2 - l) % P;
+    if (d < 0) d += P;
+    return d;
+  }
+  return -1;
+}
+
+// Write a segment's compare value: output goes high at count c0, low at the wrap (count P-1).
+// One 32 bit write, so CMPR0/CMPR1 always change together.
+static inline void ap3_set_c0(const Ap3Channel& c, int32_t period, int32_t c0) {
   volatile uint32_t* reg = (c.segment == AM_HAL_CTIMER_TIMERA)
       ? (volatile uint32_t*)CTIMERADDRn(CTIMER, c.timer, CMPRA0)
       : (volatile uint32_t*)CTIMERADDRn(CTIMER, c.timer, CMPRB0);
-  uint32_t q = period - 1;
-  *reg = _VAL2FLD(CTIMER_CMPRA0_CMPR0A0, q - on) | _VAL2FLD(CTIMER_CMPRA0_CMPR1A0, q);
+  *reg = _VAL2FLD(CTIMER_CMPRA0_CMPR0A0, (uint32_t)c0) | _VAL2FLD(CTIMER_CMPRA0_CMPR1A0, (uint32_t)(period - 1));
 }
 
-static inline void ap3_pad_gpio(const Ap3Channel& c, bool level_high) {
+// Hold a pad at its off level as a GPIO output. The level is written before the pad is
+// switched to GPIO, so it can never briefly drive a stale (possibly "on") level.
+static inline void ap3_pad_off(const Ap3Channel& c) {
+  am_hal_gpio_write_type_e lvl = c.active_high ? AM_HAL_GPIO_OUTPUT_CLEAR : AM_HAL_GPIO_OUTPUT_SET;
+  am_hal_gpio_state_write(c.pad, lvl);
   am_hal_gpio_pincfg_t cfg = g_AM_HAL_GPIO_OUTPUT;
   cfg.eDriveStrength = AP3_PWM_DRIVE;
   am_hal_gpio_pinconfig(c.pad, cfg);
-  am_hal_gpio_state_write(c.pad, level_high ? AM_HAL_GPIO_OUTPUT_SET : AM_HAL_GPIO_OUTPUT_CLEAR);
+  am_hal_gpio_state_write(c.pad, lvl);
 }
 
-static inline void ap3_pad_ctimer(const Ap3Channel& c) {
+// Connect a pad to its CTIMER segment output.
+static inline void ap3_pad_pwm(const Ap3Channel& c) {
   am_hal_ctimer_output_config(c.timer, c.segment, c.pad, AM_HAL_CTIMER_OUTPUT_NORMAL, AP3_PWM_DRIVE);
+}
+
+// Duty cycle -> compare values for phase i.
+// High side on-time h = duty*P - dead, low side on-time = (1-duty)*P - dead (approx.)
+static inline void ap3_compute(const Ap3DriverParams* p, int i, float duty, int32_t& c0H, int32_t& c0L) {
+  const int32_t P = p->period;
+  const int32_t Q = P - 1;
+  if (duty < 0.0f) duty = 0.0f;
+  if (duty > 1.0f) duty = 1.0f;
+  float hf = duty * (float)P - (float)p->dead;
+  int32_t h = (hf <= 0.0f) ? 0 : (int32_t)(hf + 0.5f);
+  int32_t hmax = Q - 2 * AP3_EDGE_MIN - p->dead - p->lag[i];
+  if (h < AP3_EDGE_MIN) h = AP3_EDGE_MIN;
+  if (h > hmax) h = hmax;
+  c0H = Q - h;                          // high side on from c0H to the wrap
+  c0L = c0H - p->dead - p->lag[i];      // low side off at c0L (+lag in the high side frame)
+}
+
+// Counter ranges (high side frame) in which the registers of phase i may be changed from the
+// current values to (nH, nL): the write is allowed if t < lowEnd, or upStart < t <= upEnd.
+//
+//  - "low" region:  before the earliest old/new edge of this phase in this period. Nothing has
+//    switched yet (high side off since its wrap, low side on since its wrap - or, for t < lag,
+//    still in the off part at the end of its previous period), so the new values simply apply
+//    to the whole period.
+//  - "up" region:   after the latest old/new edge and far enough from the wrap. Everything has
+//    switched already (high side on, low side off), the new values apply from the next period.
+// The margin (time from reading the counter until both registers are written) and the minimum
+// region length (so the polling loop cannot step over a region) are measured at start-up.
+// Returns false if neither region is usable.
+static bool ap3_regions(const Ap3DriverParams* p, int i, int32_t nH, int32_t nL,
+                        int32_t& lowEnd, int32_t& upStart, int32_t& upEnd) {
+  const int32_t Q = p->period - 1;
+  const int32_t eMin = ap3_min(p->c0L[i], nL) + p->lag[i];   // earliest "low side off"
+  const int32_t eMax = ap3_max(p->c0H[i], nH);                // latest "high side on"
+  lowEnd  = eMin - p->margin;
+  upStart = eMax + 2;
+  upEnd   = Q - p->margin;                                    // never write across the wrap
+  const bool okLow = lowEnd >= p->slot;
+  const bool okUp  = (upEnd - upStart) >= p->slot;
+  if (!okLow) lowEnd = 0;   // "t < 0" is never true
+  if (!okUp)  upEnd = -1;   // "t <= -1" is never true
+  return okLow || okUp;
+}
+
+// Update the compare registers of phase i without ever allowing high and low side on together.
+// The Apollo3 compare registers are not buffered, so the write is placed in a part of the
+// period where it cannot affect an edge that is in progress (see ap3_regions). For a big jump
+// in duty cycle there may be no such part; the update is then done in two steps via the 50%
+// values, which always leaves a usable region. Interrupts are only disabled for each single
+// read-check-write, never for the whole wait (typically < 1 us, at most about one period).
+static void ap3_write_pair(Ap3DriverParams* p, int i, int32_t nH, int32_t nL) {
+  const int32_t P = p->period;
+  const Ap3Channel& H = p->ch[2 * i];
+  const Ap3Channel& L = p->ch[2 * i + 1];
+
+  uint32_t guard = 0;
+  while (p->c0H[i] != nH || p->c0L[i] != nL) {
+    int32_t wH = nH, wL = nL, lowEnd, upStart, upEnd;
+    if (!ap3_regions(p, i, wH, wL, lowEnd, upStart, upEnd)) {
+      wH = p->midH[i];
+      wL = p->midL[i];
+      if (!ap3_regions(p, i, wH, wL, lowEnd, upStart, upEnd)) {
+        // cannot happen with the period checks in _configure6PWM - write directly
+        wH = nH; wL = nL; guard = p->guard;
+      }
+    }
+    bool written = false;
+    while (!written) {
+      uint32_t primask = am_hal_interrupt_master_disable();
+      const int32_t t = ap3_read_count(H);
+      if (guard >= p->guard || t < lowEnd || (t > upStart && t <= upEnd)) {
+        ap3_set_c0(L, P, wL);
+        ap3_set_c0(H, P, wH);
+        p->c0H[i] = wH;
+        p->c0L[i] = wL;
+        written = true;
+      }
+      am_hal_interrupt_master_set(primask);
+      guard++;   // a counter that does not run (guard reached) has no edges to protect
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -171,110 +333,203 @@ static inline void ap3_pad_ctimer(const Ap3Channel& c) {
 void* _configure6PWM(long pwm_frequency, float dead_zone, const int pinA_h, const int pinA_l, const int pinB_h, const int pinB_l, const int pinC_h, const int pinC_l) {
   if (!pwm_frequency || !_isset(pwm_frequency)) pwm_frequency = AP3_PWM_DEFAULT_FREQ;
   if (!_isset(dead_zone) || dead_zone < 0.0f) dead_zone = 0.0f;
-  if (dead_zone > 0.5f) dead_zone = 0.5f;
 
-  uint32_t period = (AP3_PWM_CLK_HZ + (uint32_t)pwm_frequency / 2) / (uint32_t)pwm_frequency;
-  if (period < AP3_PWM_MIN_PERIOD || period > AP3_PWM_MAX_PERIOD) {
-    SIMPLEFOC_DEBUG("Apollo3: unsupported PWM frequency (valid ~184 Hz .. 600 kHz): ", (int)pwm_frequency);
+  if (pwm_frequency <= 0 || (uint32_t)pwm_frequency > AP3_PWM_CLK_HZ / AP3_PWM_MIN_PERIOD) {
+    SIMPLEFOC_DEBUG("Apollo3-DRV: unsupported PWM frequency (184 Hz .. 120 kHz): ", (int)pwm_frequency);
+    return SIMPLEFOC_DRIVER_INIT_FAILED;
+  }
+  int32_t P = (int32_t)((AP3_PWM_CLK_HZ + (uint32_t)pwm_frequency / 2) / (uint32_t)pwm_frequency);
+  if (P < (int32_t)AP3_PWM_MIN_PERIOD || P > (int32_t)AP3_PWM_MAX_PERIOD) {
+    SIMPLEFOC_DEBUG("Apollo3-DRV: unsupported PWM frequency (184 Hz .. 120 kHz): ", (int)pwm_frequency);
     return SIMPLEFOC_DRIVER_INIT_FAILED;
   }
 
+  // SimpleFOC dead_zone is the fraction of the period spent in dead time; it is split
+  // between the two switching edges of each half bridge
+  int32_t dead = (int32_t)(0.5f * dead_zone * (float)P + 0.5f);
+  if (dead < AP3_MIN_DEAD) dead = AP3_MIN_DEAD;
+  if (dead > P / 8) dead = P / 8;
+
   Ap3DriverParams* p = new Ap3DriverParams();
-  p->period = period;
-  p->dead_zone = dead_zone;
+  p->period = P;
+  p->dead = dead;
 
   const int pins[6] = { pinA_h, pinA_l, pinB_h, pinB_l, pinC_h, pinC_l };
-  uint16_t used = 0;
-  uint32_t mask = 0;
   for (int i = 0; i < 6; i++) {
-    bool low_side = (i & 1);
-    if (!ap3_pick_segment((uint8_t)pins[i], used, p->ch[i])) {
-      SIMPLEFOC_DEBUG("Apollo3: no free CTIMER output for pin ", pins[i]);
+    if (ap3_find_ctx(pins[i]) < 0) {
+      SIMPLEFOC_DEBUG("Apollo3-DRV: pin has no CTIMER output: ", pins[i]);
       delete p;
       return SIMPLEFOC_DRIVER_INIT_FAILED;
     }
-    p->ch[i].active_high = low_side ? SIMPLEFOC_PWM_LOWSIDE_ACTIVE_HIGH : SIMPLEFOC_PWM_HIGHSIDE_ACTIVE_HIGH;
-    // High side: pulse is the "on" time -> not inverted when active high.
-    // Low side:  complement of the high side -> inverted when active high.
-    p->ch[i].invert = low_side ? p->ch[i].active_high : !p->ch[i].active_high;
-    mask |= ap3_globen_bit(p->ch[i]);
+  }
+  if (!ap3_allocate(pins, 0, 0, p->ch)) {
+    SIMPLEFOC_DEBUG("Apollo3-DRV: these 6 pins cannot each get their own CTIMER segment");
+    delete p;
+    return SIMPLEFOC_DRIVER_INIT_FAILED;
   }
 
-  // Hold all six segments while they are configured, then release them together
-  uint32_t globen_prev = CTIMER->GLOBEN;
-  am_hal_ctimer_globen(globen_prev & ~mask);
+  uint32_t maskH = 0, maskL = 0;
+  for (int i = 0; i < 6; i++) {
+    bool low_side = (i & 1);
+    Ap3Channel& c = p->ch[i];
+    c.active_high = low_side ? SIMPLEFOC_PWM_LOWSIDE_ACTIVE_HIGH : SIMPLEFOC_PWM_HIGHSIDE_ACTIVE_HIGH;
+    // high side: raw pulse = on time  -> inverted only if active low
+    // low side:  raw pulse = off time -> inverted if active high
+    c.invert = low_side ? c.active_high : !c.active_high;
+    if (low_side) maskL |= ap3_globen_bit(c);
+    else          maskH |= ap3_globen_bit(c);
+  }
 
+  // all pads held off while the timers are set up
+  for (int i = 0; i < 6; i++) {
+    ap3_pad_off(p->ch[i]);
+    p->pwm[i] = false;
+  }
+
+  // ---- Start-up ----------------------------------------------------------------------
+  // All six segments are configured while held in GLOBEN. Then the high side segments are
+  // released and, after a fixed ROM delay (am_hal_flash_delay, deterministic with interrupts
+  // off), the low side segments. The resulting lag is measured and the delay corrected until
+  // the lag is within a count or two of 'dead'. (Polling the counter is too coarse for this:
+  // on the Apollo3 a single counter read takes several timer counts.)
+  const uint32_t globen = CTIMER->GLOBEN & ~(maskH | maskL);
+  CTIMER->GLOBEN = globen;
   for (int i = 0; i < 6; i++) {
     const Ap3Channel& c = p->ch[i];
     uint32_t cfg = AP3_PWM_CLK | AM_HAL_CTIMER_FN_PWM_REPEAT | (c.invert ? AM_HAL_CTIMER_PIN_INVERT : 0);
-    am_hal_ctimer_config_single(c.timer, c.segment, cfg);   // also clears the counter
-    ap3_set_on_time(c, period, 2);
-    am_hal_ctimer_start(c.timer, c.segment);
+    am_hal_ctimer_config_single(c.timer, c.segment, cfg);
+    ap3_set_c0(c, P, P / 2);                                 // placeholder, pads are off
   }
 
-  // all pads start as GPIO outputs in the OFF level, until the first PHASE_ON write
-  for (int i = 0; i < 6; i++) {
-    ap3_pad_gpio(p->ch[i], !p->ch[i].active_high);
+  int32_t iters = 0, offset0 = -1, desired = dead;
+  int attempts = 0;
+  bool lag_ok = false;
+  while (attempts < AP3_LAG_ATTEMPTS && !lag_ok) {
+    attempts++;
+    uint32_t primask = am_hal_interrupt_master_disable();
+    CTIMER->GLOBEN = globen;                                   // hold all six
+    for (int i = 0; i < 6; i++) {
+      am_hal_ctimer_clear(p->ch[i].timer, p->ch[i].segment);   // counter to 0
+      am_hal_ctimer_start(p->ch[i].timer, p->ch[i].segment);   // enabled, still held by GLOBEN
+    }
+    CTIMER->GLOBEN = globen | maskH;                           // high side counters run
+    if (iters > 0) am_hal_flash_delay((uint32_t)iters);
+    CTIMER->GLOBEN = globen | maskH | maskL;                   // low side counters run
+    for (int i = 0; i < 3; i++) p->lag[i] = ap3_measure_lag(p->ch[2 * i], p->ch[2 * i + 1], P);
+    am_hal_interrupt_master_set(primask);
+
+    lag_ok = true;
+    for (int i = 0; i < 3; i++) {
+      if (p->lag[i] < ap3_max(AP3_MIN_DEAD, dead - 1) || p->lag[i] > dead + 2) lag_ok = false;
+    }
+    const int32_t m = p->lag[0];
+    if (lag_ok || m < 0) continue;
+
+    // correct the delay: lag = offset0 + 0.75 * iters (mod P)
+    if (offset0 < 0) {
+      offset0 = m;   // lag caused by the instructions between the two GLOBEN writes alone
+      // am_hal_flash_delay() has a minimum length, so keep the delay well above zero:
+      // if the overhead alone is already close to or above 'dead', aim one period further
+      desired = (dead >= offset0 + 24) ? dead : dead + P;
+      iters = (int32_t)floorf((float)(desired - offset0) / AP3_CNT_PER_DELAY_IT + 0.5f);
+    } else {
+      // unwrap the measured lag to the value closest to the one aimed for
+      const int32_t abs_lag = m + P * (int32_t)floorf((float)(desired - m) / (float)P + 0.5f);
+      iters += (int32_t)floorf((float)(desired - abs_lag) / AP3_CNT_PER_DELAY_IT + 0.5f);
+      if (iters < 0) iters = 0;
+    }
   }
-  for (int i = 0; i < 3; i++) p->mode[i] = AP3_MODE_OFF;
+  if (!lag_ok) {
+    // accept a slightly less precise result rather than failing
+    lag_ok = true;
+    for (int i = 0; i < 3; i++) {
+      if (p->lag[i] < ap3_max(AP3_MIN_DEAD, dead - 2) || p->lag[i] > dead + 6) lag_ok = false;
+    }
+  }
+  SIMPLEFOC_DEBUG("Apollo3-DRV: low side lag A [counts]: ", (int)p->lag[0]);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: low side lag B [counts]: ", (int)p->lag[1]);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: low side lag C [counts]: ", (int)p->lag[2]);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: lag without delay [counts]: ", (int)offset0);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: lag delay [iterations]: ", (int)iters);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: lag attempts: ", attempts);
+  if (!lag_ok) {
+    SIMPLEFOC_DEBUG("Apollo3-DRV: could not set the low side timer lag");
+    CTIMER->GLOBEN = globen;
+    delete p;
+    return SIMPLEFOC_DRIVER_INIT_FAILED;
+  }
 
-  am_hal_ctimer_globen(globen_prev | mask);
+  // ---- Measure how long a counter read and a register write take -----------------------
+  int32_t read_cost, write_cost;
+  {
+    const Ap3Channel& H = p->ch[0];
+    const Ap3Channel& L = p->ch[1];
+    uint32_t primask = am_hal_interrupt_master_disable();
+    int32_t t0 = ap3_read_count(H);
+    ap3_read_count(H); ap3_read_count(H); ap3_read_count(H);
+    int32_t t1 = ap3_read_count(H);
+    read_cost = ((((t1 - t0) % P) + P) % P + 2) / 4;          // 4 reads between the two samples
+    t0 = ap3_read_count(H);
+    ap3_set_c0(L, P, P / 2);                                   // placeholder values, pads are off
+    ap3_set_c0(H, P, P / 2);
+    t1 = ap3_read_count(H);
+    am_hal_interrupt_master_set(primask);
+    write_cost = (((t1 - t0) % P) + P) % P - read_cost;
+    if (write_cost < 0) write_cost = 0;
+  }
+  // margin: the counter value may be up to one read old, then the check, then two writes
+  p->margin = 2 * read_cost + write_cost + 4;
+  // a region must be longer than one turn of the polling loop
+  p->slot   = 2 * read_cost + 4;
+  p->guard  = (uint32_t)(4 * P / ap3_max(read_cost, 1)) + 1000;
+  SIMPLEFOC_DEBUG("Apollo3-DRV: counter read [counts]: ", (int)read_cost);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: 2 register writes [counts]: ", (int)write_cost);
 
-  SIMPLEFOC_DEBUG("Apollo3: CTIMER 6PWM, period [counts]: ", (int)period);
+  const int32_t lag_max = ap3_max(p->lag[0], ap3_max(p->lag[1], p->lag[2]));
+  const int32_t p_min = 2 * (p->margin + p->slot + dead + lag_max + 8);
+  if (P < p_min) {
+    SIMPLEFOC_DEBUG("Apollo3-DRV: PWM frequency too high, max [Hz]: ", (int)(AP3_PWM_CLK_HZ / (uint32_t)p_min));
+    CTIMER->GLOBEN = globen;
+    delete p;
+    return SIMPLEFOC_DRIVER_INIT_FAILED;
+  }
+
+  // initial compare values for 0 duty (pads are still off, so no timing needed)
+  for (int i = 0; i < 3; i++) {
+    ap3_compute(p, i, 0.5f, p->midH[i], p->midL[i]);
+    int32_t c0H, c0L;
+    ap3_compute(p, i, 0.0f, c0H, c0L);
+    ap3_set_c0(p->ch[2 * i], P, c0H);
+    ap3_set_c0(p->ch[2 * i + 1], P, c0L);
+    p->c0H[i] = c0H;
+    p->c0L[i] = c0L;
+  }
+
+  SIMPLEFOC_DEBUG("Apollo3-DRV: CTIMER 6PWM, period [counts]: ", (int)P);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: dead time [counts]: ", (int)dead);
+  SIMPLEFOC_DEBUG("Apollo3-DRV: wrap edge dead time [counts]: ", (int)ap3_min(p->lag[0], ap3_min(p->lag[1], p->lag[2])));
   return p;
 }
 
-static inline void ap3_set_pair_mode(Ap3DriverParams* p, int i, Ap3PairMode m) {
-  const Ap3Channel& H = p->ch[2 * i];
-  const Ap3Channel& L = p->ch[2 * i + 1];
-  switch (m) {
-    case AP3_MODE_OFF: ap3_pad_gpio(H, !H.active_high); ap3_pad_gpio(L, !L.active_high); break;
-    case AP3_MODE_HI:  ap3_pad_gpio(H,  H.active_high); ap3_pad_gpio(L, !L.active_high); break;
-    case AP3_MODE_LO:  ap3_pad_gpio(H, !H.active_high); ap3_pad_gpio(L,  L.active_high); break;
-    default:           ap3_pad_ctimer(H); ap3_pad_ctimer(L); break;
-  }
-  p->mode[i] = m;
-}
+// Set one half bridge.
+static void _ap3SetPwmPair(Ap3DriverParams* p, int i, float duty, PhaseState state) {
+  const bool wantH = (state == PhaseState::PHASE_ON || state == PhaseState::PHASE_HI);
+  const bool wantL = (state == PhaseState::PHASE_ON || state == PhaseState::PHASE_LO);
+  const int iH = 2 * i, iL = 2 * i + 1;
 
-// Set one half bridge: complementary H/L pair with dead zone.
-// duty in [0,1] is the fraction of the period for which the high side is (nominally) on.
-//
-// High side on-time h = duty*P - dead/2     -> pulse at the end of the period
-// Low side  raw  r    = duty*P + dead/2     -> output inverted: low side is on for the first (P - r) counts
-// Gap between them    = r - h = dead counts (at least 2)
-static inline void _ap3SetPwmPair(Ap3DriverParams* p, int i, float duty, PhaseState state) {
-  Ap3PairMode want;
-  switch (state) {
-    case PhaseState::PHASE_ON: want = AP3_MODE_PWM; break;
-    case PhaseState::PHASE_HI: want = AP3_MODE_HI;  break;
-    case PhaseState::PHASE_LO: want = AP3_MODE_LO;  break;
-    default:                   want = AP3_MODE_OFF; break;
-  }
-  if (want != AP3_MODE_PWM) {
-    if (p->mode[i] != want) ap3_set_pair_mode(p, i, want);
-    return;
-  }
+  // 1. switch off whatever must be off
+  if (!wantH && p->pwm[iH]) { ap3_pad_off(p->ch[iH]); p->pwm[iH] = false; }
+  if (!wantL && p->pwm[iL]) { ap3_pad_off(p->ch[iL]); p->pwm[iL] = false; }
+  if (!wantH && !wantL) return;
 
-  const uint32_t P = p->period;
-  if (duty < 0.0f) duty = 0.0f;
-  if (duty > 1.0f) duty = 1.0f;
-  float on   = duty * (float)P;
-  float half = 0.5f * p->dead_zone * (float)P;
-  if (half < 1.0f) half = 1.0f;                 // never less than 2 counts (167 ns) of gap
+  // 2. new compare values, written at a safe moment
+  int32_t c0H, c0L;
+  ap3_compute(p, i, duty, c0H, c0L);
+  ap3_write_pair(p, i, c0H, c0L);
 
-  int32_t h = (int32_t)(on - half + 0.5f);
-  int32_t r = (int32_t)(on + half + 0.5f);
-  // hardware limits: pulse >= 1 count and <= period-3 counts
-  int32_t rmax = (int32_t)P - 3;
-  if (h < 2) h = 2;
-  if (h > rmax - 2) h = rmax - 2;
-  if (r < h + 2) r = h + 2;
-  if (r > rmax) r = rmax;
-
-  ap3_set_on_time(p->ch[2 * i],     P, (uint32_t)h);
-  ap3_set_on_time(p->ch[2 * i + 1], P, (uint32_t)r);
-
-  if (p->mode[i] != AP3_MODE_PWM) ap3_set_pair_mode(p, i, AP3_MODE_PWM);
+  // 3. connect the sides that run PWM
+  if (wantH && !p->pwm[iH]) { ap3_pad_pwm(p->ch[iH]); p->pwm[iH] = true; }
+  if (wantL && !p->pwm[iL]) { ap3_pad_pwm(p->ch[iL]); p->pwm[iL] = true; }
 }
 
 // Function setting the duty cycle to the pwm pins
