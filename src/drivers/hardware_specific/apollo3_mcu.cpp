@@ -49,7 +49,11 @@
  *   - PWM is edge aligned (the Apollo3 counters only count up).
  *   - CTIMER 7 is never used, because mbed uses it for the low power ticker.
  *   - Pads are mapped to CTIMER segments automatically (with backtracking) from the same pad
- *     table the SparkFun core uses; each pin gets its own segment.
+ *     table the SparkFun core uses; each pin gets its own segment. Several 6PWM drivers can
+ *     be used: segments are tracked across drivers (14 available = 2 drivers), and segments
+ *     that few pads can use are taken first, to leave the flexible ones for later drivers.
+ *     Pads 37 and 39 are supported via their normal timer outputs (the core's analogWrite
+ *     treats them specially, which does not apply here).
  *   - The duty cycle is clamped near the ends: at 20 kHz with the default 2% dead zone,
  *     duty values below ~1.3% or above ~97.5% are clamped (the high side pulse never
  *     gets shorter than 2 counts, the low side pulse never shorter than ~4 counts).
@@ -162,30 +166,69 @@ static inline uint32_t ap3_globen_bit(const Ap3Channel& c) {
 }
 
 static int ap3_find_ctx(int pad) {
-  if (pad < 0 || pad == 37 || pad == 39) return -1;   // 37/39 are special-cased in the core
+  if (pad < 0) return -1;
   for (int ctx = 0; ctx < 32; ctx++) {
     if (AP3_CTX_PADNUM(ctx) == pad) return ctx;
   }
   return -1;
 }
 
-// Give each pin its own CTIMER segment (primary OUT only, never timer 7). Backtracking.
+// CTIMER segments in use by all 6PWM drivers (bit = timer*2 + B). Timer 7 is reserved:
+// mbed uses it for the low power ticker.
+static uint16_t ap3_used_segments = (1u << 14) | (1u << 15);
+
+// Segments a pad can drive on its primary OUT (never OUT2, never timer 7), as GLOBEN bit
+// numbers, in table order. Returns the count.
+static int ap3_pad_options(int ctx, uint8_t* bits) {
+  int n = 0;
+  for (int k = 0; k < 4; k++) {
+    uint8_t v = ap3_outcfg_tbl[ctx][k];
+    if (v & 0x10) continue;                    // OUT2 - not used
+    uint8_t timer = v & 0x7;
+    if (timer == 7) continue;
+    uint8_t bit = (uint8_t)(timer * 2 + ((v & 0x8) ? 1 : 0));
+    bool dup = false;
+    for (int j = 0; j < n; j++) dup |= (bits[j] == bit);
+    if (!dup) bits[n++] = bit;
+  }
+  return n;
+}
+
+// How many pads can drive a segment. Segments that few pads can use are taken first, which
+// leaves the widely usable ones (e.g. A1, the only option for pad 37) for later drivers.
+static int ap3_segment_popularity(uint8_t bit) {
+  int count = 0;
+  for (int ctx = 0; ctx < 32; ctx++) {
+    uint8_t bits[4];
+    int n = ap3_pad_options(ctx, bits);
+    for (int j = 0; j < n; j++) count += (bits[j] == bit);
+  }
+  return count;
+}
+
+// Give each pin its own CTIMER segment, avoiding segments other drivers use. Backtracking.
 static bool ap3_allocate(const int* pins, int idx, uint16_t used, Ap3Channel* ch) {
   if (idx == 6) return true;
   int ctx = ap3_find_ctx(pins[idx]);
   if (ctx < 0) return false;
-  for (int n = 0; n < 4; n++) {
-    uint8_t v = ap3_outcfg_tbl[ctx][n];
-    if (v & 0x10) continue;                    // OUT2 - not used
-    uint8_t timer = v & 0x7;
-    bool isB = (v & 0x8) != 0;
-    if (timer == 7) continue;                  // used by mbed low power ticker
-    uint16_t bit = 1u << (timer * 2 + (isB ? 1 : 0));
-    if (used & bit) continue;
+  uint8_t bits[4];
+  int pop[4];
+  int n = ap3_pad_options(ctx, bits);
+  for (int j = 0; j < n; j++) pop[j] = ap3_segment_popularity(bits[j]);
+  // stable sort by popularity, least popular first
+  for (int a = 1; a < n; a++) {
+    for (int b = a; b > 0 && pop[b] < pop[b - 1]; b--) {
+      uint8_t tb = bits[b]; bits[b] = bits[b - 1]; bits[b - 1] = tb;
+      int tp = pop[b]; pop[b] = pop[b - 1]; pop[b - 1] = tp;
+    }
+  }
+  for (int j = 0; j < n; j++) {
+    uint16_t mask = (uint16_t)(1u << bits[j]);
+    if (used & mask) continue;
     ch[idx].pad = (uint8_t)pins[idx];
-    ch[idx].timer = timer;
-    ch[idx].segment = isB ? AM_HAL_CTIMER_TIMERB : AM_HAL_CTIMER_TIMERA;
-    if (ap3_allocate(pins, idx + 1, used | bit, ch)) return true;
+    ch[idx].timer = bits[j] >> 1;
+    ch[idx].segment = (bits[j] & 1) ? AM_HAL_CTIMER_TIMERB : AM_HAL_CTIMER_TIMERA;
+    if (ap3_allocate(pins, idx + 1, used | mask, ch)) return true;
   }
   return false;
 }
@@ -362,8 +405,8 @@ void* _configure6PWM(long pwm_frequency, float dead_zone, const int pinA_h, cons
       return SIMPLEFOC_DRIVER_INIT_FAILED;
     }
   }
-  if (!ap3_allocate(pins, 0, 0, p->ch)) {
-    SIMPLEFOC_DEBUG("Apollo3-DRV: these 6 pins cannot each get their own CTIMER segment");
+  if (!ap3_allocate(pins, 0, ap3_used_segments, p->ch)) {
+    SIMPLEFOC_DEBUG("Apollo3-DRV: these 6 pins cannot each get their own free CTIMER segment");
     delete p;
     return SIMPLEFOC_DRIVER_INIT_FAILED;
   }
@@ -379,6 +422,8 @@ void* _configure6PWM(long pwm_frequency, float dead_zone, const int pinA_h, cons
     if (low_side) maskL |= ap3_globen_bit(c);
     else          maskH |= ap3_globen_bit(c);
   }
+  // reserve the segments for this driver (GLOBEN bit numbers = segment numbers)
+  ap3_used_segments |= (uint16_t)(maskH | maskL);
 
   // all pads held off while the timers are set up
   for (int i = 0; i < 6; i++) {
@@ -455,6 +500,7 @@ void* _configure6PWM(long pwm_frequency, float dead_zone, const int pinA_h, cons
   if (!lag_ok) {
     SIMPLEFOC_DEBUG("Apollo3-DRV: could not set the low side timer lag");
     CTIMER->GLOBEN = globen;
+    ap3_used_segments &= (uint16_t)~(maskH | maskL);
     delete p;
     return SIMPLEFOC_DRIVER_INIT_FAILED;
   }
@@ -490,6 +536,7 @@ void* _configure6PWM(long pwm_frequency, float dead_zone, const int pinA_h, cons
   if (P < p_min) {
     SIMPLEFOC_DEBUG("Apollo3-DRV: PWM frequency too high, max [Hz]: ", (int)(AP3_PWM_CLK_HZ / (uint32_t)p_min));
     CTIMER->GLOBEN = globen;
+    ap3_used_segments &= (uint16_t)~(maskH | maskL);
     delete p;
     return SIMPLEFOC_DRIVER_INIT_FAILED;
   }
